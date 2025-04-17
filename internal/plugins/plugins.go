@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -219,6 +220,14 @@ func (p Plugin) GetExtensionCommands() ([]string, error) {
 	return commands, nil
 }
 
+func (p Plugin) IsLocal() (bool, error) {
+	info, err := os.Lstat(p.Dir)
+	if err != nil {
+		return false, err
+	}
+	return info.Mode()&os.ModeSymlink != 0, nil
+}
+
 // ExtensionCommandPath returns the path to the plugin's extension command
 // script matching the name if it exists.
 func (p Plugin) ExtensionCommandPath(name string) (string, error) {
@@ -242,6 +251,15 @@ func (p Plugin) Update(conf config.Config, ref string, out, errout io.Writer) (s
 	err := p.Exists()
 	if err != nil {
 		return "", fmt.Errorf("no such plugin: %s", p.Name)
+	}
+
+	isLocal, err := p.IsLocal()
+	if err != nil {
+		return "", fmt.Errorf("error checking if plugin is local: %w", err)
+	}
+
+	if isLocal {
+		return "Skipping update for local plugin", nil
 	}
 
 	repo := git.NewRepo(p.Dir)
@@ -286,7 +304,9 @@ func List(config config.Config, urls, refs bool) (plugins []Plugin, err error) {
 	}
 
 	for _, file := range files {
-		if file.IsDir() {
+		isSymlink := file.Type()&os.ModeSymlink != 0
+
+		if file.IsDir() || isSymlink {
 			if refs || urls {
 				var url string
 				var refString string
@@ -298,17 +318,19 @@ func List(config config.Config, urls, refs bool) (plugins []Plugin, err error) {
 					return plugins, err
 				}
 
-				if refs {
-					refString, err = repo.Head()
-					if err != nil {
-						return plugins, err
+				if !isSymlink {
+					if refs {
+						refString, err = repo.Head()
+						if err != nil {
+							return plugins, err
+						}
 					}
-				}
 
-				if urls {
-					url, err = repo.RemoteURL()
-					if err != nil {
-						return plugins, err
+					if urls {
+						url, err = repo.RemoteURL()
+						if err != nil {
+							return plugins, err
+						}
 					}
 				}
 
@@ -332,7 +354,7 @@ func List(config config.Config, urls, refs bool) (plugins []Plugin, err error) {
 
 // Add takes plugin name and Git URL and installs the plugin if it isn't
 // already installed
-func Add(config config.Config, pluginName, pluginURL, ref string) error {
+func Add(config config.Config, pluginName, pluginPath, ref string) error {
 	err := validatePluginName(pluginName)
 	if err != nil {
 		return err
@@ -349,7 +371,7 @@ func Add(config config.Config, pluginName, pluginURL, ref string) error {
 
 	plugin := New(config, pluginName)
 
-	if pluginURL == "" {
+	if pluginPath == "" {
 		// Ignore error here as the default value is fine
 		disablePluginIndex, _ := config.DisablePluginShortNameRepository()
 
@@ -367,26 +389,38 @@ func Add(config config.Config, pluginName, pluginURL, ref string) error {
 
 		index := pluginindex.Build(config.DataDir, config.PluginIndexURL, false, lastCheckDuration)
 		var err error
-		pluginURL, err = index.GetPluginSourceURL(pluginName)
+		pluginPath, err = index.GetPluginSourceURL(pluginName)
 		if err != nil {
 			return fmt.Errorf("error fetching plugin URL: %s", err)
 		}
 	}
 
-	plugin.URL = pluginURL
+	isPath := isFilePath(pluginPath)
 
 	// Run pre hooks
 	hook.Run(config, "pre_asdf_plugin_add", []string{plugin.Name})
 	hook.Run(config, fmt.Sprintf("pre_asdf_plugin_add_%s", plugin.Name), []string{})
 
-	err = git.NewRepo(plugin.Dir).Clone(plugin.URL, ref)
-	if err != nil {
-		return err
-	}
+	if !isPath {
+		plugin.URL = pluginPath
+		err = git.NewRepo(plugin.Dir).Clone(plugin.URL, ref)
+		if err != nil {
+			return err
+		}
 
-	err = os.MkdirAll(data.DownloadDirectory(config.DataDir, plugin.Name), 0o777)
-	if err != nil {
-		return err
+		err = os.MkdirAll(data.DownloadDirectory(config.DataDir, plugin.Name), 0o777)
+		if err != nil {
+			return err
+		}
+	} else {
+		resolvedPath, err := filepath.Abs(pluginPath)
+		if err != nil {
+			return fmt.Errorf("error resolving absolute path: %s", err)
+		}
+
+		if err := os.Symlink(resolvedPath, plugin.Dir); err != nil {
+			return err
+		}
 	}
 
 	env := map[string]string{"ASDF_PLUGIN_SOURCE_URL": plugin.URL, "ASDF_PLUGIN_PATH": plugin.Dir}
@@ -479,4 +513,15 @@ func validatePluginName(name string) error {
 	}
 
 	return nil
+}
+
+func isURL(str string) bool {
+	u, err := url.Parse(str)
+	return err == nil && u.Scheme != "" && u.Host != ""
+}
+
+// Returns true if the string is likely a file path, not a URL
+func isFilePath(str string) bool {
+	// Consider anything that fails the URL test to be a path
+	return !isURL(str)
 }

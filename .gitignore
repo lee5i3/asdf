@@ -11,3 +11,6 @@ dist/
 
 # ignore build binary
 asdf
+
+# ignore vs code
+.vscode
